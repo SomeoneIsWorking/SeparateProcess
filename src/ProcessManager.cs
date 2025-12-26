@@ -95,28 +95,26 @@ public class ProcessManager(Type serviceType, ILogger logger)
             await CallMethodAsync(nameof(IBackgroundService.StopAsync), []);
             writer = null;
         }
-        if (commandPipe != null)
+
+        commandPipe?.Close();
+        commandPipe = null;
+        responsePipe?.Close();
+        responsePipe = null;
+
+        if (process == null)
         {
-            commandPipe.Close();
-            commandPipe = null;
+            return;
         }
-        if (responsePipe != null)
+
+        if (outputHandler != null) { process.OutputDataReceived -= outputHandler; outputHandler = null; }
+        if (errorHandler != null) { process.ErrorDataReceived -= errorHandler; errorHandler = null; }
+        if (exitedHandler != null) { process.Exited -= exitedHandler; exitedHandler = null; }
+        if (!process.HasExited)
         {
-            responsePipe.Close();
-            responsePipe = null;
+            process.Kill();
         }
-        if (process != null)
-        {
-            if (outputHandler != null) { process.OutputDataReceived -= outputHandler; outputHandler = null; }
-            if (errorHandler != null) { process.ErrorDataReceived -= errorHandler; errorHandler = null; }
-            if (exitedHandler != null) { process.Exited -= exitedHandler; exitedHandler = null; }
-            if (!process.HasExited)
-            {
-                process.Kill();
-            }
-            await process.WaitForExitAsync();
-            process = null;
-        }
+        await process.WaitForExitAsync();
+        process = null;
     }
 
     public void RegisterEventHandler(string eventName, Delegate handler)
@@ -226,29 +224,13 @@ public class ProcessManager(Type serviceType, ILogger logger)
         {
             var level = reader.ReadString();
             var msg = reader.ReadString();
-            switch (level)
+            if (Enum.TryParse<LogLevel>(level, out var logLevel))
             {
-                case "Trace":
-                    logger.LogTrace("[{Level}] {Message}", level, msg);
-                    break;
-                case "Debug":
-                    logger.LogDebug("[Runner] {Message}", msg);
-                    break;
-                case "Information":
-                    logger.LogInformation("[Runner] {Message}", msg);
-                    break;
-                case "Warning":
-                    logger.LogWarning("[Runner] {Message}", msg);
-                    break;
-                case "Error":
-                    logger.LogError("[Runner] {Message}", msg);
-                    break;
-                case "Critical":
-                    logger.LogCritical("[Runner] {Message}", msg);
-                    break;
-                default:
-                    logger.LogInformation("[Runner] {Message}", msg);
-                    break;
+                logger.Log(logLevel, "[Runner] {Message}", msg);
+            }
+            else
+            {
+                logger.LogInformation("[Runner] {Message}", msg);
             }
         }
         else if (type == MessageType.Response)
