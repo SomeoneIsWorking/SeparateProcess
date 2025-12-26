@@ -3,15 +3,8 @@ using Microsoft.Extensions.Logging;
 
 namespace SeparateProcess;
 
-public class ProcessLogger : ILogger
+public class ProcessLogger(Action<LogLevel, string> sendLog) : ILogger
 {
-    private readonly Action<LogLevel, string> sendLog;
-
-    public ProcessLogger(Action<LogLevel, string> sendLog)
-    {
-        this.sendLog = sendLog;
-    }
-
     public IDisposable? BeginScope<TState>(TState state) where TState : notnull
     {
         return null;
@@ -31,5 +24,15 @@ public class ProcessLogger : ILogger
 
         var message = formatter(state, exception);
         sendLog(logLevel, message);
+    }
+}
+
+public class ProcessLoggerProvider(Action<LogLevel, string> sendLog) : ILoggerProvider
+{
+    public ILogger CreateLogger(string categoryName) => new ProcessLogger(sendLog);
+
+    public void Dispose()
+    {
+        GC.SuppressFinalize(this);
     }
 }

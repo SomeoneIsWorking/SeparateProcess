@@ -2,10 +2,11 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipes;
 using MessagePack;
+using Microsoft.Extensions.Logging;
 
 namespace SeparateProcess;
 
-public class ProcessManager(Type serviceType)
+public class ProcessManager(Type serviceType, ILogger logger)
 {
     private Process? process;
     private NamedPipeServerStream? commandPipe;
@@ -26,7 +27,7 @@ public class ProcessManager(Type serviceType)
 
     public async Task StartProcess()
     {
-        Console.WriteLine("[Main] Starting process");
+        logger.LogDebug("Starting process");
         // Start process
         process = new Process();
         process.StartInfo.FileName = Environment.ProcessPath!;
@@ -44,7 +45,14 @@ public class ProcessManager(Type serviceType)
         process.BeginErrorReadLine();
         exitedHandler = new EventHandler((s, e) =>
         {
-            try { Console.WriteLine($"[Process] Process exited with code {process.ExitCode}"); } catch { Console.WriteLine("[Process] Process exited"); }
+            try
+            {
+                logger.LogInformation("Process exited with code {ExitCode}", process.ExitCode);
+            }
+            catch
+            {
+                logger.LogInformation("Process exited");
+            }
             // Fail all pending requests
             var items = pendingRequests.ToArray();
             foreach (var kvp in items)
@@ -57,12 +65,12 @@ public class ProcessManager(Type serviceType)
 
         // Start command pipe server (main writes, process reads)
         commandPipe = new NamedPipeServerStream(commandPipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.None, 4 * 1024 * 1024, 4 * 1024 * 1024);
-        Console.WriteLine("[Main] Waiting for command pipe connection");
+        logger.LogDebug("Waiting for command pipe connection");
         await commandPipe.WaitForConnectionAsync();
 
         // Start response pipe server (main reads, process writes)
         responsePipe = new NamedPipeServerStream(responsePipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.None, 4 * 1024 * 1024, 4 * 1024 * 1024);
-        Console.WriteLine("[Main] Waiting for response pipe connection");
+        logger.LogDebug("Waiting for response pipe connection");
         await responsePipe.WaitForConnectionAsync();
 
         // Check if process exited
@@ -73,7 +81,7 @@ public class ProcessManager(Type serviceType)
 
         // Create proxy
         writer = new BinaryWriter(commandPipe, System.Text.Encoding.UTF8, leaveOpen: true);
-        Console.WriteLine("[Main] Process started successfully");
+        logger.LogInformation("Process started successfully");
 
         // Start listening for messages
         _ = Task.Run(ListenForMessages);
@@ -81,7 +89,7 @@ public class ProcessManager(Type serviceType)
 
     public async Task GracefulShutdownAsync()
     {
-        Console.WriteLine("[Main] Shutting down process");
+        logger.LogInformation("Shutting down process");
         if (writer != null && process != null && !process.HasExited)
         {
             await CallMethodAsync(nameof(IBackgroundService.StopAsync), []);
@@ -114,7 +122,7 @@ public class ProcessManager(Type serviceType)
     public void RegisterEventHandler(string eventName, Delegate handler)
     {
         eventHandlers[eventName] = (Delegate)Delegate.Combine(eventHandlers.GetValueOrDefault(eventName), handler);
-        Console.WriteLine($"[Main] Registered event handler for {eventName}");
+        logger.LogDebug("Registered event handler for {EventName}", eventName);
     }
 
     public void RemoveEventHandler(string eventName, Delegate handler)
@@ -145,9 +153,9 @@ public class ProcessManager(Type serviceType)
             writer.Flush();
             commandPipe!.Flush();
         }
-        Console.WriteLine($"[Main] Sending {method} with id {id}");
+        logger.LogDebug("Sending {Method} with id {Id}", method, id);
         var result = await tcs.Task;
-        Console.WriteLine($"[Main] {method} completed");
+        logger.LogDebug("{Method} completed", method);
         return result;
     }
 
@@ -198,18 +206,19 @@ public class ProcessManager(Type serviceType)
             var eventName = reader.ReadString();
             var length = reader.ReadInt32();
             var bytes = reader.ReadBytes(length);
-            var obj = MessagePackSerializer.Deserialize<object>(bytes);
-            Console.WriteLine($"[Main] Received event {eventName}: {obj}");
+            logger.LogDebug("Received event {EventName}", eventName);
             if (eventHandlers.TryGetValue(eventName, out var del))
             {
-                Console.WriteLine($"[Main] Invoking event {eventName} with {obj}");
+                logger.LogDebug("Invoking event {EventName}", eventName);
                 try
                 {
-                    del?.DynamicInvoke(obj);
+                    var paramType = del.Method.GetParameters()[0].ParameterType;
+                    var deserializedObj = MessagePackSerializer.Deserialize(paramType, bytes);
+                    del?.DynamicInvoke(deserializedObj);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[Main] Error invoking event: {ex}");
+                    logger.LogError(ex, "Error invoking event {EventName}", eventName);
                 }
             }
         }
@@ -217,7 +226,30 @@ public class ProcessManager(Type serviceType)
         {
             var level = reader.ReadString();
             var msg = reader.ReadString();
-            Console.WriteLine($"[{level}] {msg}");
+            switch (level)
+            {
+                case "Trace":
+                    logger.LogTrace("[{Level}] {Message}", level, msg);
+                    break;
+                case "Debug":
+                    logger.LogDebug("[Runner] {Message}", msg);
+                    break;
+                case "Information":
+                    logger.LogInformation("[Runner] {Message}", msg);
+                    break;
+                case "Warning":
+                    logger.LogWarning("[Runner] {Message}", msg);
+                    break;
+                case "Error":
+                    logger.LogError("[Runner] {Message}", msg);
+                    break;
+                case "Critical":
+                    logger.LogCritical("[Runner] {Message}", msg);
+                    break;
+                default:
+                    logger.LogInformation("[Runner] {Message}", msg);
+                    break;
+            }
         }
         else if (type == MessageType.Response)
         {
@@ -249,14 +281,14 @@ public class ProcessManager(Type serviceType)
     {
         if (e.Data != null)
         {
-            Console.WriteLine($"[Process stdout] {e.Data}");
+            logger.LogInformation("[Process stdout] {Data}", e.Data);
         }
     }
     private void OnErrorDataReceived(object? sender, DataReceivedEventArgs e)
     {
         if (e.Data != null)
         {
-            Console.WriteLine($"[Process stderr] {e.Data}");
+            logger.LogWarning("[Process stderr] {Data}", e.Data);
         }
     }
 }
