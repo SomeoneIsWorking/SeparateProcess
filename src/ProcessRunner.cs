@@ -2,22 +2,16 @@ using System.IO.Pipes;
 using MessagePack;
 using Microsoft.Extensions.Logging;
 using System.Reflection;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace SeparateProcess;
 
 public class ProcessRunner
 {
-    public static ProcessRunner? Get(string[] args)
-    {
-        if (args.Length > 1 && args[0] == "--process")
-        {
-            return new ProcessRunner(args);
-        }
-        return null;
-    }
-
     private readonly string commandPipeName;
     private readonly string responsePipeName;
+    private readonly ServiceProvider provider;
+    private readonly ILogger logger;
     private readonly string handlerTypeName;
     private IBackgroundService? handler;
     private NamedPipeClientStream? commandPipe;
@@ -25,8 +19,13 @@ public class ProcessRunner
     private readonly object pipeLock = new();
     private BinaryWriter? writer;
 
-    private ProcessRunner(string[] args)
+    public ProcessRunner(string[] args)
     {
+        var services = new ServiceCollection();
+        services.AddLogging(builder => builder.AddProvider(new ProcessLoggerProvider(SendLog)));
+        provider = services.BuildServiceProvider();
+        logger = provider.GetRequiredService<ILogger<ProcessRunner>>();
+
         // Parse args: --process <type> --command-pipe <name> --response-pipe <name>
         handlerTypeName = "";
         commandPipeName = "";
@@ -53,37 +52,26 @@ public class ProcessRunner
 
     public async Task<int> Run()
     {
-        try
-        {
-            Log("Starting process");
-            commandPipe = new NamedPipeClientStream(".", commandPipeName, PipeDirection.In);
-            Log("Connecting to command pipe");
-            commandPipe.Connect();
+        commandPipe = new NamedPipeClientStream(".", commandPipeName, PipeDirection.In);
+        commandPipe.Connect();
 
-            responsePipe = new NamedPipeClientStream(".", responsePipeName, PipeDirection.Out);
-            Log("Connecting to response pipe");
-            responsePipe.Connect();
+        responsePipe = new NamedPipeClientStream(".", responsePipeName, PipeDirection.Out);
+        responsePipe.Connect();
 
-            writer = new BinaryWriter(responsePipe, System.Text.Encoding.UTF8, leaveOpen: true);
+        writer = new BinaryWriter(responsePipe, System.Text.Encoding.UTF8, leaveOpen: true);
 
-            InitializeHandler();
+        InitializeHandler();
 
-            // Start listening for messages
-            var listenTask = Task.Run(() => ListenForMessages(commandPipe));
+        // Start listening for messages
+        var listenTask = Task.Run(() => ListenForMessages(commandPipe));
 
-            Log("Process initialized");
+        logger.LogInformation("Process initialized");
 
-            // Wait for stop
-            await listenTask;
+        // Wait for stop
+        await listenTask;
 
-            Log("Process stopped");
-            return 0;
-        }
-        catch (Exception ex)
-        {
-            LogError("Process error", ex);
-            return 1;
-        }
+        logger.LogInformation("Process stopped");
+        return 0;
     }
 
     private async Task ListenForMessages(NamedPipeClientStream pipe)
@@ -91,15 +79,7 @@ public class ProcessRunner
         using var reader = new BinaryReader(pipe, System.Text.Encoding.UTF8, leaveOpen: true);
         while (true)
         {
-            try
-            {
-                await ProcessMessage(reader);
-            }
-            catch (Exception ex)
-            {
-                LogError("Error reading message", ex);
-                break;
-            }
+            await ProcessMessage(reader);
         }
     }
 
@@ -116,14 +96,14 @@ public class ProcessRunner
     {
         var id = reader.ReadInt32();
         var method = reader.ReadString();
-        Console.WriteLine($"[Process] Received call {method} with id {id}");
-        Log($"Handling {method} with id {id}");
+        logger.LogDebug($"Received call {method} with id {id}");
+        logger.LogDebug($"Handling {method} with id {id}");
         var length = reader.ReadInt32();
         var bytes = reader.ReadBytes(length);
         var args = MessagePackSerializer.Deserialize<object[]>(bytes);
         try
         {
-            var methodInfo = handler!.GetType().GetMethod(method) 
+            var methodInfo = handler!.GetType().GetMethod(method)
                 ?? throw new Exception($"Method {method} not found");
             var invokeResult = methodInfo.Invoke(handler, args);
             object? result = null;
@@ -140,13 +120,13 @@ public class ProcessRunner
             {
                 result = invokeResult;
             }
-            Console.WriteLine($"[Process] {method} with id {id} completed: {result}");
+            logger.LogDebug($"{method} with id {id} completed: {result}");
             SendResponse(id, "success", result);
-            Console.WriteLine($"[Process] Sent response for {method} with id {id}");
+            logger.LogDebug($"Sent response for {method} with id {id}");
         }
         catch (Exception ex)
         {
-            LogError($"Error handling message {method}", ex);
+            logger.LogError(ex, $"Error handling message {method}");
             var errorMessage = ex is TargetInvocationException tie ? tie.InnerException?.Message ?? ex.Message : ex.Message;
             SendResponse(id, "error", errorMessage);
         }
@@ -182,10 +162,51 @@ public class ProcessRunner
             writer.Flush();
             responsePipe!.Flush();
         }
-        Console.WriteLine($"[Process] Sending event {eventName}: {data}");
+        logger.LogDebug($"Sending event {eventName}: {data}");
     }
 
-    private void SendLog(LogLevel level, string message)
+    private Action<T> CreateAction<T>(string eventName)
+    {
+        return data =>
+        {
+            logger.LogDebug($"Action {eventName} called with {data}");
+            SendEvent(eventName, data);
+        };
+    }
+
+    private void InitializeHandler()
+    {
+        // Create handler using reflection
+        Type? handlerType = Assembly.GetEntryAssembly()!.GetType(handlerTypeName);
+        logger.LogDebug($"Handler type name: {handlerTypeName}, type: {handlerType}");
+        if (handlerType == null)
+        {
+            throw new Exception($"Handler type {handlerTypeName} not found");
+        }
+        handler = (IBackgroundService)ActivatorUtilities.CreateInstance(provider, handlerType);
+        logger.LogDebug("Handler created");
+        // Set up events
+        var eventInfos = handlerType.GetEvents(BindingFlags.Public | BindingFlags.Instance);
+        foreach (var eventInfo in eventInfos)
+        {
+            var eventName = eventInfo.Name;
+            var eventType = eventInfo.EventHandlerType;
+            if (eventType is { IsGenericType: true } && eventType.GetGenericTypeDefinition() == typeof(Action<>))
+            {
+                var argType = eventType.GetGenericArguments()[0];
+                var method = typeof(ProcessRunner).GetMethod(nameof(CreateAction), BindingFlags.NonPublic | BindingFlags.Instance);
+                var genericMethod = method!.MakeGenericMethod(argType);
+                var action = genericMethod.Invoke(this, [eventName]);
+                var addMethod = eventInfo.GetAddMethod();
+                var addMethodGeneric = addMethod!.IsGenericMethod ? addMethod.MakeGenericMethod(argType) : addMethod;
+                addMethodGeneric.Invoke(handler, [action]);
+            }
+        }
+        // Start the handler
+        _ = Task.Run(async () => await handler.StartAsync());
+    }
+
+    public void SendLog(LogLevel level, string message)
     {
         lock (pipeLock)
         {
@@ -194,71 +215,6 @@ public class ProcessRunner
             writer.Write(message);
             writer.Flush();
             responsePipe!.Flush();
-        }
-    }
-
-    private void Log(string message)
-    {
-        Console.WriteLine($"[Process] {message}");
-    }
-
-    private void LogError(string message, Exception ex)
-    {
-        Console.Error.WriteLine($"[Process Error] {message}: {ex}");
-    }
-
-    private Action<T> CreateAction<T>(string eventName)
-    {
-        return data => { Console.WriteLine($"[Process] Action {eventName} called with {data}"); SendEvent(eventName, data); };
-    }
-
-    private void InitializeHandler()
-    {
-        // Create handler using reflection
-        Type? handlerType = Assembly.GetEntryAssembly()!.GetType(handlerTypeName);
-        Console.WriteLine($"Handler type name: {handlerTypeName}, type: {handlerType}");
-        if (handlerType != null)
-        {
-            var processLogger = new ProcessLogger((level, msg) => SendLog(level, msg));
-            handler = (IBackgroundService)Activator.CreateInstance(handlerType)!;
-            Console.WriteLine("Handler created");
-            if (handler != null)
-            {
-                // Set up action properties
-                var actionProperties = handlerType.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                    .Where(p => p.PropertyType.IsGenericType && p.PropertyType.GetGenericTypeDefinition() == typeof(Action<>));
-                foreach (var prop in actionProperties)
-                {
-                    var actionType = prop.PropertyType;
-                    var argType = actionType.GetGenericArguments()[0];
-                    var method = typeof(ProcessRunner).GetMethod(nameof(CreateAction), BindingFlags.NonPublic | BindingFlags.Instance);
-                    var genericMethod = method!.MakeGenericMethod(argType);
-                    var action = genericMethod.Invoke(this, [prop.Name]);
-                    prop.SetValue(handler, action);
-                }
-                // Set up events
-                var eventInfos = handlerType.GetEvents(BindingFlags.Public | BindingFlags.Instance);
-                foreach (var eventInfo in eventInfos)
-                {
-                    var eventName = eventInfo.Name;
-                    var eventType = eventInfo.EventHandlerType;
-                    if (eventType is { IsGenericType: true } && eventType.GetGenericTypeDefinition() == typeof(Action<>))
-                    {
-                        var argType = eventType.GetGenericArguments()[0];
-                        var method = typeof(ProcessRunner).GetMethod(nameof(CreateAction), BindingFlags.NonPublic | BindingFlags.Instance);
-                        var genericMethod = method!.MakeGenericMethod(argType);
-                        var action = genericMethod.Invoke(this, [eventName]);
-                        var addMethod = eventInfo.GetAddMethod();
-                        addMethod!.Invoke(handler, [action]);
-                    }
-                }
-                // Start the handler
-                _ = Task.Run(async () => await handler.StartAsync());
-            }
-        }
-        else
-        {
-            Console.WriteLine("Handler type not found");
         }
     }
 }

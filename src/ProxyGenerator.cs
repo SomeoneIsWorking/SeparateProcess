@@ -3,42 +3,57 @@ using System.Reflection.Emit;
 
 namespace SeparateProcess;
 
-public class ProxyGenerator
+public class ProxyGenerator<T> where T : class, IBackgroundService
 {
     private static readonly Type managerType = typeof(ProcessManager);
     private readonly Type _virtualType;
     private readonly FieldInfo _managerField;
     private readonly TypeBuilder _typeBuilder;
 
-    public ProxyGenerator(Type virtualType)
+    public ProxyGenerator()
     {
-        _virtualType = virtualType;
+        _virtualType = typeof(T);
         var assemblyName = new AssemblyName("ProxyAssembly");
         var assembly = AssemblyBuilder.DefineDynamicAssembly(assemblyName, AssemblyBuilderAccess.Run);
         var module = assembly.DefineDynamicModule("ProxyModule");
-        _typeBuilder = module.DefineType("Proxy" + virtualType.Name, TypeAttributes.Public | TypeAttributes.Class, virtualType, null);
+        _typeBuilder = module.DefineType("Proxy" + _virtualType.Name, TypeAttributes.Public | TypeAttributes.Class, _virtualType, null);
         _managerField = _typeBuilder.DefineField("_manager", typeof(object), FieldAttributes.Private);
     }
 
-    public static TService CreateProxy<TService>(ProcessManager manager) where TService : class, IBackgroundService
+    public static T CreateProxy(ProcessManager manager)
     {
-        var generator = new ProxyGenerator(typeof(TService));
-        return (TService)generator.GenerateProxy(manager);
+        var generator = new ProxyGenerator<T>();
+        return (T)generator.GenerateProxy(manager);
     }
 
     private object GenerateProxy(ProcessManager manager)
     {
         var type = GenerateProxyType();
-        return Activator.CreateInstance(type, manager)!;
+        var baseCtor = _virtualType.GetConstructors()[0];
+        var baseParams = baseCtor.GetParameters();
+        var args = new List<object?> { manager };
+        foreach (var param in baseParams)
+        {
+            args.Add(param.ParameterType.IsValueType ? Activator.CreateInstance(param.ParameterType) : null);
+        }
+        return Activator.CreateInstance(type, [.. args])!;
     }
 
     private Type GenerateProxyType()
     {
+        var baseCtor = _virtualType.GetConstructors()[0];
+        var baseParams = baseCtor.GetParameters();
+        var proxyParams = new[] { typeof(object) }.Concat(baseParams.Select(p => p.ParameterType)).ToArray();
+
         // Constructor
-        var ctor = _typeBuilder.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, [typeof(object)]);
+        var ctor = _typeBuilder.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, proxyParams);
         var il = ctor.GetILGenerator();
         il.Emit(OpCodes.Ldarg_0);
-        il.Emit(OpCodes.Call, _virtualType.GetConstructor(Type.EmptyTypes)!);
+        for (int i = 0; i < baseParams.Length; i++)
+        {
+            il.Emit(OpCodes.Ldarg, i + 2);
+        }
+        il.Emit(OpCodes.Call, baseCtor);
         il.Emit(OpCodes.Ldarg_0);
         il.Emit(OpCodes.Ldarg_1);
         il.Emit(OpCodes.Stfld, _managerField);
@@ -70,7 +85,6 @@ public class ProxyGenerator
         {
             if (method.IsSpecialName || method.DeclaringType == typeof(object) || !method.IsVirtual)
             {
-                Console.WriteLine($"Skipping method: {method.Name}");
                 continue;
             }
             var paramTypes = method.GetParameters().Select(p => p.ParameterType).ToArray();
@@ -115,7 +129,6 @@ public class ProxyGenerator
 
     private void EmitCallProcessManagerMethod(ILGenerator il, MethodInfo method)
     {
-        Console.WriteLine($"Generating call for method: {method.Name}");
         if (method.Name == nameof(IBackgroundService.StopAsync))
         {
             var stopMethod = GetProcessManagerMethod(nameof(ProcessManager.GracefulShutdownAsync));

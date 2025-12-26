@@ -1,11 +1,23 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
 namespace SeparateProcess;
 
 public static class Spawner
 {
-    public static async Task<TService> Spawn<TService>() where TService : class, IBackgroundService
+    public static ProcessRunner? GetRunner(string[] args)
     {
-        var manager = new ProcessManager(typeof(TService));
-        var service = ProxyGenerator.CreateProxy<TService>(manager);
+        if (args.Length > 1 && args[0] == "--process")
+        {
+            return new ProcessRunner(args);
+        }
+        return null;
+    }
+
+    public static async Task<TService> Spawn<TService>(ILogger logger) where TService : class, IBackgroundService
+    {
+        var manager = new ProcessManager(typeof(TService), logger);
+        var service = ProxyGenerator<TService>.CreateProxy(manager);
         await manager.StartProcess();
         return service;
     }
