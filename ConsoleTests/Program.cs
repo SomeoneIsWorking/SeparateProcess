@@ -1,19 +1,9 @@
-﻿using SeparateProcess;
+﻿using Microsoft.Extensions.Logging.Abstractions;
+using SeparateProcess;
 
-if (args.Length > 0 && args[0] == "--process")
+if (Spawner.GetRunner(args) is ProcessRunner runner)
 {
-    // Runner mode
-    var runner = ProcessRunner.Get(args);
-    if (runner != null)
-    {
-        var exitCode = await runner.Run();
-        Environment.Exit(exitCode);
-    }
-    else
-    {
-        Console.WriteLine("Invalid runner args");
-        Environment.Exit(1);
-    }
+    var exitCode = await runner.Run();
 }
 else
 {
@@ -26,7 +16,7 @@ async Task RunTests()
 {
     Console.WriteLine("Starting tests...");
 
-    var service = await Spawner.Spawn<TestService>();
+    var service = await Spawner.Spawn<TestService>(NullLogger.Instance);
 
     // Test simple call
     var result = service.Add(5, 3);
@@ -97,7 +87,7 @@ async Task RunTests()
         }
     }
 
-    service = await Spawner.Spawn<TestService>();
+    service = await Spawner.Spawn<TestService>(NullLogger.Instance);
     await service.StopAsync();
 
     Console.WriteLine("All tests passed!");

@@ -191,19 +191,12 @@ public class ProcessRunner
         {
             var eventName = eventInfo.Name;
             var eventType = eventInfo.EventHandlerType;
-            if (eventType is { IsGenericType: true } && eventType.GetGenericTypeDefinition() == typeof(Action<>))
-            {
-                var argType = eventType.GetGenericArguments()[0];
-                var method = typeof(ProcessRunner).GetMethod(nameof(CreateAction), BindingFlags.NonPublic | BindingFlags.Instance);
-                var genericMethod = method!.MakeGenericMethod(argType);
-                var action = genericMethod.Invoke(this, [eventName]);
-                var addMethod = eventInfo.GetAddMethod();
-                var addMethodGeneric = addMethod!.IsGenericMethod ? addMethod.MakeGenericMethod(argType) : addMethod;
-                addMethodGeneric.Invoke(handler, [action]);
-            }
+            var argType = eventType!.GetGenericArguments()[0];
+            var method = typeof(ProcessRunner).GetMethod(nameof(CreateAction), BindingFlags.NonPublic | BindingFlags.Instance);
+            var genericMethod = method!.MakeGenericMethod(argType);
+            var action = genericMethod.Invoke(this, [eventName]);
+            eventInfo.AddMethod?.Invoke(handler, [action]);
         }
-        // Start the handler
-        _ = Task.Run(async () => await handler.StartAsync());
     }
 
     public void SendLog(LogLevel level, string message)
