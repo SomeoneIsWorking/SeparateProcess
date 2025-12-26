@@ -1,0 +1,29 @@
+# Binaries
+bin/
+obj/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+
+# Test results
+TestResults/
+*.trx
+
+# Coverage
+coverage/
+*.coverage
