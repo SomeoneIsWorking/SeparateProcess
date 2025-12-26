@@ -19,7 +19,7 @@ public class ProcessRunner
     private readonly string commandPipeName;
     private readonly string responsePipeName;
     private readonly string handlerTypeName;
-    private IProcessHandler? handler;
+    private IBackgroundService? handler;
     private NamedPipeClientStream? commandPipe;
     private NamedPipeClientStream? responsePipe;
     private readonly object pipeLock = new();
@@ -123,11 +123,8 @@ public class ProcessRunner
         var args = MessagePackSerializer.Deserialize<object[]>(bytes);
         try
         {
-            var methodInfo = handler!.GetType().GetMethod(method);
-            if (methodInfo == null)
-            {
-                throw new Exception($"Method {method} not found");
-            }
+            var methodInfo = handler!.GetType().GetMethod(method) 
+                ?? throw new Exception($"Method {method} not found");
             var invokeResult = methodInfo.Invoke(handler, args);
             object? result = null;
             if (invokeResult is Task task)
@@ -135,7 +132,7 @@ public class ProcessRunner
                 await task;
                 if (methodInfo.ReturnType.IsGenericType && methodInfo.ReturnType.GetGenericTypeDefinition() == typeof(Task<>))
                 {
-                    var resultProperty = methodInfo.ReturnType.GetProperty("Result");
+                    var resultProperty = methodInfo.ReturnType.GetProperty(nameof(Task<object>.Result));
                     result = resultProperty?.GetValue(task);
                 }
             }
@@ -150,6 +147,8 @@ public class ProcessRunner
         catch (Exception ex)
         {
             LogError($"Error handling message {method}", ex);
+            var errorMessage = ex is TargetInvocationException tie ? tie.InnerException?.Message ?? ex.Message : ex.Message;
+            SendResponse(id, "error", errorMessage);
         }
     }
 
@@ -183,6 +182,7 @@ public class ProcessRunner
             writer.Flush();
             responsePipe!.Flush();
         }
+        Console.WriteLine($"[Process] Sending event {eventName}: {data}");
     }
 
     private void SendLog(LogLevel level, string message)
@@ -209,33 +209,51 @@ public class ProcessRunner
 
     private Action<T> CreateAction<T>(string eventName)
     {
-        return data => SendEvent(eventName, data);
+        return data => { Console.WriteLine($"[Process] Action {eventName} called with {data}"); SendEvent(eventName, data); };
     }
 
     private void InitializeHandler()
     {
         // Create handler using reflection
-        Type? handlerType = Assembly.GetExecutingAssembly().GetType(handlerTypeName);
+        Type? handlerType = Assembly.GetEntryAssembly()!.GetType(handlerTypeName);
         Console.WriteLine($"Handler type name: {handlerTypeName}, type: {handlerType}");
         if (handlerType != null)
         {
             var processLogger = new ProcessLogger((level, msg) => SendLog(level, msg));
-            handler = (IProcessHandler)Activator.CreateInstance(handlerType, processLogger)!;
+            handler = (IBackgroundService)Activator.CreateInstance(handlerType)!;
             Console.WriteLine("Handler created");
             if (handler != null)
             {
-                // Set up action fields
-                var actionFields = handlerType.GetFields(BindingFlags.Public | BindingFlags.Instance)
-                    .Where(f => f.FieldType.IsGenericType && f.FieldType.GetGenericTypeDefinition() == typeof(Action<>));
-                foreach (var field in actionFields)
+                // Set up action properties
+                var actionProperties = handlerType.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                    .Where(p => p.PropertyType.IsGenericType && p.PropertyType.GetGenericTypeDefinition() == typeof(Action<>));
+                foreach (var prop in actionProperties)
                 {
-                    var actionType = field.FieldType;
+                    var actionType = prop.PropertyType;
                     var argType = actionType.GetGenericArguments()[0];
                     var method = typeof(ProcessRunner).GetMethod(nameof(CreateAction), BindingFlags.NonPublic | BindingFlags.Instance);
                     var genericMethod = method!.MakeGenericMethod(argType);
-                    var action = genericMethod.Invoke(this, [field.Name]);
-                    field.SetValue(handler, action);
+                    var action = genericMethod.Invoke(this, [prop.Name]);
+                    prop.SetValue(handler, action);
                 }
+                // Set up events
+                var eventInfos = handlerType.GetEvents(BindingFlags.Public | BindingFlags.Instance);
+                foreach (var eventInfo in eventInfos)
+                {
+                    var eventName = eventInfo.Name;
+                    var eventType = eventInfo.EventHandlerType;
+                    if (eventType is { IsGenericType: true } && eventType.GetGenericTypeDefinition() == typeof(Action<>))
+                    {
+                        var argType = eventType.GetGenericArguments()[0];
+                        var method = typeof(ProcessRunner).GetMethod(nameof(CreateAction), BindingFlags.NonPublic | BindingFlags.Instance);
+                        var genericMethod = method!.MakeGenericMethod(argType);
+                        var action = genericMethod.Invoke(this, [eventName]);
+                        var addMethod = eventInfo.GetAddMethod();
+                        addMethod!.Invoke(handler, [action]);
+                    }
+                }
+                // Start the handler
+                _ = Task.Run(async () => await handler.StartAsync());
             }
         }
         else

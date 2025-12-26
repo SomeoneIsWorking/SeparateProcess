@@ -1,19 +1,19 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipes;
-using System.Linq.Expressions;
 using MessagePack;
 
 namespace SeparateProcess;
 
-public class ProcessManager<THandler> where THandler : IProcessHandler
+public class ProcessManager(Type serviceType)
 {
     private Process? process;
     private NamedPipeServerStream? commandPipe;
     private NamedPipeServerStream? responsePipe;
     private readonly string commandPipeName = $"w{Guid.NewGuid().ToString("N")[..8]}c";
     private readonly string responsePipeName = $"w{Guid.NewGuid().ToString("N")[..8]}r";
-    private readonly Dictionary<int, TaskCompletionSource<object?>> pendingRequests = [];
-    private readonly Dictionary<string, (Delegate handler, Type argType)> eventHandlers = [];
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<object?>> pendingRequests = [];
+    private readonly Dictionary<string, Delegate> eventHandlers = [];
     private int nextId = 0;
 
     private readonly Lock writePipeLock = new();
@@ -30,7 +30,7 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
         // Start process
         process = new Process();
         process.StartInfo.FileName = Environment.ProcessPath!;
-        process.StartInfo.Arguments = $"--process {typeof(THandler).FullName} --command-pipe {commandPipeName} --response-pipe {responsePipeName}";
+        process.StartInfo.Arguments = $"--process {serviceType.FullName} --command-pipe {commandPipeName} --response-pipe {responsePipeName}";
         process.StartInfo.UseShellExecute = false;
         process.StartInfo.RedirectStandardOutput = true;
         process.StartInfo.RedirectStandardError = true;
@@ -38,13 +38,20 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
 
         // Start reading stdout/stderr early so logs are visible
         process.EnableRaisingEvents = true;
-        process.OutputDataReceived += (s, e) => { Console.WriteLine($"[Process stdout] {e.Data}"); };
-        process.ErrorDataReceived += (s, e) => { Console.WriteLine($"[Process stderr] {e.Data}"); };
+        process.OutputDataReceived += OnOutputDataReceived;
+        process.ErrorDataReceived += OnErrorDataReceived;
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
         exitedHandler = new EventHandler((s, e) =>
         {
             try { Console.WriteLine($"[Process] Process exited with code {process.ExitCode}"); } catch { Console.WriteLine("[Process] Process exited"); }
+            // Fail all pending requests
+            var items = pendingRequests.ToArray();
+            foreach (var kvp in items)
+            {
+                kvp.Value.SetException(new Exception("Process exited unexpectedly"));
+            }
+            pendingRequests.Clear();
         });
         process.Exited += exitedHandler;
 
@@ -72,11 +79,12 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
         _ = Task.Run(ListenForMessages);
     }
 
-    public async Task Stop()
+    public async Task GracefulShutdownAsync()
     {
-        if (writer != null)
+        Console.WriteLine("[Main] Shutting down process");
+        if (writer != null && process != null && !process.HasExited)
         {
-            await Call(x => x.Stop());
+            await CallMethodAsync(nameof(IBackgroundService.StopAsync), []);
             writer = null;
         }
         if (commandPipe != null)
@@ -103,40 +111,25 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
         }
     }
 
-    public async Task Call(Expression<Action<THandler>> expr)
+    public void RegisterEventHandler(string eventName, Delegate handler)
     {
-        var call = (MethodCallExpression)expr.Body;
-        var methodName = call.Method.Name;
-        var args = call.Arguments.Select(a => Expression.Lambda(a).Compile().DynamicInvoke()).ToArray();
-        await SendCall(methodName, args);
+        eventHandlers[eventName] = (Delegate)Delegate.Combine(eventHandlers.GetValueOrDefault(eventName), handler);
+        Console.WriteLine($"[Main] Registered event handler for {eventName}");
     }
 
-    public async Task Call(Expression<Func<THandler, Task>> expr)
+    public void RemoveEventHandler(string eventName, Delegate handler)
     {
-        var call = (MethodCallExpression)expr.Body;
-        var methodName = call.Method.Name;
-        var args = call.Arguments.Select(a => Expression.Lambda(a).Compile().DynamicInvoke()).ToArray();
-        await SendCall(methodName, args);
+        if (eventHandlers.TryGetValue(eventName, out var existing))
+        {
+            Delegate? removed = Delegate.Remove(existing, handler);
+            if (removed == null)
+                eventHandlers.Remove(eventName);
+            else
+                eventHandlers[eventName] = removed;
+        }
     }
 
-
-    public async Task<T> Call<T>(Expression<Func<THandler, T>> expr)
-    {
-        var call = (MethodCallExpression)expr.Body;
-        var methodName = call.Method.Name;
-        var args = call.Arguments.Select(a => Expression.Lambda(a).Compile().DynamicInvoke()).ToArray();
-        var result = await SendCall(methodName, args);
-        return (T)result!;
-    }
-
-    public void On<T>(Expression<Func<THandler, Action<T>>> eventExpr, Action<T> handler)
-    {
-        var member = (MemberExpression)eventExpr.Body;
-        var eventName = member.Member.Name;
-        eventHandlers[eventName] = (handler, typeof(T));
-    }
-
-    private async Task<object?> SendCall(string method, object?[] args)
+    internal async Task<object?> SendCall(string method, object?[] args)
     {
         int id = Interlocked.Increment(ref nextId);
         var tcs = new TaskCompletionSource<object?>();
@@ -158,6 +151,28 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
         return result;
     }
 
+    public async Task CallMethodAsync(string method, object?[] args)
+    {
+        await SendCall(method, args);
+    }
+
+    public async Task<T> CallMethodGenericAsync<T>(string method, object?[] args)
+    {
+        var result = await SendCall(method, args);
+        return (T)result!;
+    }
+
+    public T CallMethodGeneric<T>(string method, object?[] args)
+    {
+        var result = SendCall(method, args).Result;
+        return (T)result!;
+    }
+
+    public void CallMethod(string method, object?[] args)
+    {
+        SendCall(method, args).Wait();
+    }
+
     public void ListenForMessages()
     {
         if (responsePipe == null) return;
@@ -168,9 +183,8 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
             {
                 HandleMessage(reader);
             }
-            catch (Exception ex)
+            catch
             {
-                Console.WriteLine($"[Main] Error reading message: {ex}");
                 break;
             }
         }
@@ -184,10 +198,19 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
             var eventName = reader.ReadString();
             var length = reader.ReadInt32();
             var bytes = reader.ReadBytes(length);
-            if (eventHandlers.TryGetValue(eventName, out var tuple))
+            var obj = MessagePackSerializer.Deserialize<object>(bytes);
+            Console.WriteLine($"[Main] Received event {eventName}: {obj}");
+            if (eventHandlers.TryGetValue(eventName, out var del))
             {
-                var obj = MessagePackSerializer.Deserialize(tuple.argType, bytes);
-                tuple.handler.DynamicInvoke(obj);
+                Console.WriteLine($"[Main] Invoking event {eventName} with {obj}");
+                try
+                {
+                    del?.DynamicInvoke(obj);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Main] Error invoking event: {ex}");
+                }
             }
         }
         else if (type == MessageType.Log)
@@ -209,9 +232,8 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
 
     private void HandleResponse(int id, string status, object? result)
     {
-        if (pendingRequests.TryGetValue(id, out var tcs))
+        if (pendingRequests.TryRemove(id, out var tcs))
         {
-            pendingRequests.Remove(id);
             if (status == "success")
             {
                 tcs.SetResult(result);
@@ -220,6 +242,21 @@ public class ProcessManager<THandler> where THandler : IProcessHandler
             {
                 tcs.SetException(new Exception(result?.ToString() ?? "Unknown error"));
             }
+        }
+    }
+
+    private void OnOutputDataReceived(object? sender, DataReceivedEventArgs e)
+    {
+        if (e.Data != null)
+        {
+            Console.WriteLine($"[Process stdout] {e.Data}");
+        }
+    }
+    private void OnErrorDataReceived(object? sender, DataReceivedEventArgs e)
+    {
+        if (e.Data != null)
+        {
+            Console.WriteLine($"[Process stderr] {e.Data}");
         }
     }
 }
