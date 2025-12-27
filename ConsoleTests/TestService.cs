@@ -1,11 +1,10 @@
 using SeparateProcess;
 using Microsoft.Extensions.Logging;
 
-public class TestService(ILogger<TestService> logger) : IBackgroundService
+public class TestService(ILogger<TestService> logger) : ISeparateProcess
 {
     private readonly ILogger logger = logger;
     public virtual event Action<string>? OnMessage;
-    public virtual Task StartAsync() => Task.CompletedTask;
     public virtual Task StopAsync() => Task.CompletedTask;
     public virtual int Add(int a, int b) => a + b;
     public virtual string Echo(string msg)

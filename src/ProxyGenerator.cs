@@ -3,7 +3,7 @@ using System.Reflection.Emit;
 
 namespace SeparateProcess;
 
-public class ProxyGenerator<T> where T : class, IBackgroundService
+public class ProxyGenerator<T> where T : class, ISeparateProcess
 {
     private static readonly Type managerType = typeof(ProcessManager);
     private readonly Type _virtualType;
@@ -23,10 +23,10 @@ public class ProxyGenerator<T> where T : class, IBackgroundService
     public static T CreateProxy(ProcessManager manager)
     {
         var generator = new ProxyGenerator<T>();
-        return (T)generator.GenerateProxy(manager);
+        return generator.GenerateProxy(manager);
     }
 
-    private object GenerateProxy(ProcessManager manager)
+    private T GenerateProxy(ProcessManager manager)
     {
         var type = GenerateProxyType();
         var baseCtor = _virtualType.GetConstructors()[0];
@@ -36,7 +36,7 @@ public class ProxyGenerator<T> where T : class, IBackgroundService
         {
             args.Add(param.ParameterType.IsValueType ? Activator.CreateInstance(param.ParameterType) : null);
         }
-        return Activator.CreateInstance(type, [.. args])!;
+        return (T)Activator.CreateInstance(type, [.. args])!;
     }
 
     private Type GenerateProxyType()
@@ -129,7 +129,7 @@ public class ProxyGenerator<T> where T : class, IBackgroundService
 
     private void EmitCallProcessManagerMethod(ILGenerator il, MethodInfo method)
     {
-        if (method.Name == nameof(IBackgroundService.StopAsync))
+        if (method.Name == nameof(ISeparateProcess.StopAsync))
         {
             var stopMethod = GetProcessManagerMethod(nameof(ProcessManager.GracefulShutdownAsync));
             il.Emit(OpCodes.Callvirt, stopMethod);

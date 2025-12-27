@@ -92,7 +92,7 @@ public class ProcessManager(Type serviceType, ILogger logger)
         logger.LogInformation("Shutting down process");
         if (writer != null && process != null && !process.HasExited)
         {
-            await CallMethodAsync(nameof(IBackgroundService.StopAsync), []);
+            await CallMethodAsync(nameof(ISeparateProcess.StopAsync), []);
             writer = null;
         }
 
@@ -111,6 +111,7 @@ public class ProcessManager(Type serviceType, ILogger logger)
         if (exitedHandler != null) { process.Exited -= exitedHandler; exitedHandler = null; }
         if (!process.HasExited)
         {
+            logger.LogWarning("Process did not exit in time, killing");
             process.Kill();
         }
         await process.WaitForExitAsync();
