@@ -1,4 +1,6 @@
-﻿using Microsoft.Extensions.Logging.Abstractions;
+﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging.Console;
 using SeparateProcess;
 
 if (Spawner.GetRunner(args) is ProcessRunner runner)
@@ -16,7 +18,10 @@ async Task RunTests()
 {
     Console.WriteLine("Starting tests...");
 
-    var service = await Spawner.Spawn<TestService>(NullLogger.Instance);
+    var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
+    var logger = loggerFactory.CreateLogger<TestService>();
+
+    var service = await Spawner.Spawn<TestService>(logger);
 
     // Test simple call
     var result = service.Add(5, 3);
@@ -87,7 +92,7 @@ async Task RunTests()
         }
     }
 
-    service = await Spawner.Spawn<TestService>(NullLogger.Instance);
+    service = await Spawner.Spawn<TestService>(logger);
     await service.StopAsync();
 
     Console.WriteLine("All tests passed!");

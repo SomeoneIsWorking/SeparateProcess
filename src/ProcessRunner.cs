@@ -13,11 +13,13 @@ public class ProcessRunner
     private readonly ServiceProvider provider;
     private readonly ILogger logger;
     private readonly string handlerTypeName;
-    private IBackgroundService? handler;
+    private ISeparateProcess? handler;
     private NamedPipeClientStream? commandPipe;
     private NamedPipeClientStream? responsePipe;
     private readonly object pipeLock = new();
     private BinaryWriter? writer;
+    private volatile bool isStopped = false;
+    private int _stopId;
 
     public ProcessRunner(string[] args)
     {
@@ -62,22 +64,18 @@ public class ProcessRunner
 
         InitializeHandler();
 
-        // Start listening for messages
-        var listenTask = Task.Run(() => ListenForMessages(commandPipe));
+        await Task.Run(() => ListenForMessages(commandPipe));
 
-        logger.LogInformation("Process initialized");
-
-        // Wait for stop
-        await listenTask;
-
-        logger.LogInformation("Process stopped");
+        logger.LogDebug("Process initialized");
+        SendResponse(_stopId, "success", null);
+        logger.LogDebug("Process stopped");
         return 0;
     }
 
     private async Task ListenForMessages(NamedPipeClientStream pipe)
     {
         using var reader = new BinaryReader(pipe, System.Text.Encoding.UTF8, leaveOpen: true);
-        while (true)
+        while (!isStopped)
         {
             await ProcessMessage(reader);
         }
@@ -121,8 +119,21 @@ public class ProcessRunner
                 result = invokeResult;
             }
             logger.LogDebug($"{method} with id {id} completed: {result}");
-            SendResponse(id, "success", result);
+
+            // Do not send response for StopAsync here
+            // The main process will do it after event loop ends
+            if (method == nameof(ISeparateProcess.StopAsync))
+            {
+                isStopped = true;
+                _stopId = id;
+            }
+            else
+            {
+                SendResponse(id, "success", result);
+            }
+
             logger.LogDebug($"Sent response for {method} with id {id}");
+
         }
         catch (Exception ex)
         {
@@ -183,7 +194,7 @@ public class ProcessRunner
         {
             throw new Exception($"Handler type {handlerTypeName} not found");
         }
-        handler = (IBackgroundService)ActivatorUtilities.CreateInstance(provider, handlerType);
+        handler = (ISeparateProcess)ActivatorUtilities.CreateInstance(provider, handlerType);
         logger.LogDebug("Handler created");
         // Set up events
         var eventInfos = handlerType.GetEvents(BindingFlags.Public | BindingFlags.Instance);

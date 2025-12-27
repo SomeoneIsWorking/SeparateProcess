@@ -13,7 +13,7 @@ public static class Spawner
         return null;
     }
 
-    public static async Task<TService> Spawn<TService>(ILogger logger) where TService : class, IBackgroundService
+    public static async Task<TService> Spawn<TService>(ILogger logger) where TService : class, ISeparateProcess
     {
         var manager = new ProcessManager(typeof(TService), logger);
         var service = ProxyGenerator<TService>.CreateProxy(manager);
