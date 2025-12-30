@@ -132,9 +132,8 @@ public class ProcessRunner
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, $"Error handling message {method}");
-            var errorMessage = ex is TargetInvocationException tie ? tie.InnerException?.Message ?? ex.Message : ex.Message;
-            SendResponse(id, "error", errorMessage);
+            var errorMessage = ex is TargetInvocationException tie ? tie.InnerException : ex;
+            SendResponse(id, "error", ex.ToString());
         }
     }
 
