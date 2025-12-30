@@ -1,5 +1,4 @@
 using System.IO.Pipes;
-using MessagePack;
 using Microsoft.Extensions.Logging;
 using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
@@ -92,13 +91,9 @@ public class ProcessRunner
 
     private async Task HandleCall(BinaryReader reader)
     {
-        var id = reader.ReadInt32();
-        var method = reader.ReadString();
+        var (id, method, returnType, args) = MessageProtocol.ReadCall(reader);
         logger.LogDebug($"Received call {method} with id {id}");
         logger.LogDebug($"Handling {method} with id {id}");
-        var length = reader.ReadInt32();
-        var bytes = reader.ReadBytes(length);
-        var args = MessagePackSerializer.Deserialize<object[]>(bytes);
         try
         {
             var methodInfo = handler!.GetType().GetMethod(method)
@@ -145,32 +140,20 @@ public class ProcessRunner
 
     private void SendResponse(int id, string status, object? result)
     {
-        var resultBytes = result != null ? MessagePackSerializer.Serialize(result) : Array.Empty<byte>();
         lock (pipeLock)
         {
-            writer!.Write((byte)MessageType.Response);
-            writer.Write(id);
-            writer.Write(status);
-            writer.Write(resultBytes.Length);
-            if (resultBytes.Length > 0)
-            {
-                writer.Write(resultBytes);
-            }
-            writer.Flush();
+            MessageProtocol.WriteResponse(writer!, id, status, result);
+            writer!.Flush();
             responsePipe!.Flush();
         }
     }
 
     private void SendEvent(string eventName, object? data)
     {
-        var dataBytes = MessagePackSerializer.Serialize(data);
         lock (pipeLock)
         {
-            writer!.Write((byte)MessageType.Event);
-            writer.Write(eventName);
-            writer.Write(dataBytes.Length);
-            writer.Write(dataBytes);
-            writer.Flush();
+            MessageProtocol.WriteEvent(writer!, eventName, data);
+            writer!.Flush();
             responsePipe!.Flush();
         }
         logger.LogDebug($"Sending event {eventName}: {data}");
@@ -214,10 +197,8 @@ public class ProcessRunner
     {
         lock (pipeLock)
         {
-            writer!.Write((byte)MessageType.Log);
-            writer.Write(level.ToString());
-            writer.Write(message);
-            writer.Flush();
+            MessageProtocol.WriteLog(writer!, level, message);
+            writer!.Flush();
             responsePipe!.Flush();
         }
     }

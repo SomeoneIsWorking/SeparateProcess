@@ -13,7 +13,7 @@ public class ProcessManager(Type serviceType, ILogger logger)
     private NamedPipeServerStream? responsePipe;
     private readonly string commandPipeName = $"w{Guid.NewGuid().ToString("N")[..8]}c";
     private readonly string responsePipeName = $"w{Guid.NewGuid().ToString("N")[..8]}r";
-    private readonly ConcurrentDictionary<int, TaskCompletionSource<object?>> pendingRequests = [];
+    private readonly ConcurrentDictionary<int, PendingRequest> pendingRequests = new();
     private readonly Dictionary<string, Delegate> eventHandlers = [];
     private int nextId = 0;
 
@@ -23,6 +23,16 @@ public class ProcessManager(Type serviceType, ILogger logger)
     private DataReceivedEventHandler? outputHandler;
     private DataReceivedEventHandler? errorHandler;
     private EventHandler? exitedHandler;
+
+    private class PendingRequest
+    {
+        public string ReturnType { get; }
+        public TaskCompletionSource<object?> Tcs { get; } = new();
+        public PendingRequest(string returnType)
+        {
+            ReturnType = returnType;
+        }
+    }
 
 
     public async Task StartProcess()
@@ -57,7 +67,7 @@ public class ProcessManager(Type serviceType, ILogger logger)
             var items = pendingRequests.ToArray();
             foreach (var kvp in items)
             {
-                kvp.Value.SetException(new Exception("Process exited unexpectedly"));
+                kvp.Value.Tcs.SetException(new Exception("Process exited unexpectedly"));
             }
             pendingRequests.Clear();
         });
@@ -136,48 +146,44 @@ public class ProcessManager(Type serviceType, ILogger logger)
         }
     }
 
-    internal async Task<object?> SendCall(string method, object?[] args)
+    internal async Task<object?> SendCall(string method, object?[] args, string returnType)
     {
+        args ??= [];
         int id = Interlocked.Increment(ref nextId);
-        var tcs = new TaskCompletionSource<object?>();
-        pendingRequests[id] = tcs;
-        var argsBytes = MessagePackSerializer.Serialize(args);
+        var pr = new PendingRequest(returnType);
+        pendingRequests[id] = pr;
         lock (writePipeLock)
         {
-            writer!.Write((byte)MessageType.Call);
-            writer.Write(id);
-            writer.Write(method);
-            writer.Write(argsBytes.Length);
-            writer.Write(argsBytes);
-            writer.Flush();
+            MessageProtocol.WriteCall(writer!, id, method, returnType, args);
+            writer!.Flush();
             commandPipe!.Flush();
         }
         logger.LogDebug("Sending {Method} with id {Id}", method, id);
-        var result = await tcs.Task;
+        var result = await pr.Tcs.Task;
         logger.LogDebug("{Method} completed", method);
         return result;
     }
 
     public async Task CallMethodAsync(string method, object?[] args)
     {
-        await SendCall(method, args);
+        await SendCall(method, args, typeof(object).FullName!);
     }
 
     public async Task<T> CallMethodGenericAsync<T>(string method, object?[] args)
     {
-        var result = await SendCall(method, args);
+        var result = await SendCall(method, args, typeof(T).FullName!);
         return (T)result!;
     }
 
     public T CallMethodGeneric<T>(string method, object?[] args)
     {
-        var result = SendCall(method, args).Result;
+        var result = SendCall(method, args, typeof(T).FullName!).Result;
         return (T)result!;
     }
 
     public void CallMethod(string method, object?[] args)
     {
-        SendCall(method, args).Wait();
+        SendCall(method, args, typeof(void).FullName!).Wait();
     }
 
     public void ListenForMessages()
@@ -202,9 +208,7 @@ public class ProcessManager(Type serviceType, ILogger logger)
         var type = (MessageType)reader.ReadByte();
         if (type == MessageType.Event)
         {
-            var eventName = reader.ReadString();
-            var length = reader.ReadInt32();
-            var bytes = reader.ReadBytes(length);
+            var (eventName, bytes) = MessageProtocol.ReadEvent(reader);
             logger.LogDebug("Received event {EventName}", eventName);
             if (eventHandlers.TryGetValue(eventName, out var del))
             {
@@ -223,16 +227,8 @@ public class ProcessManager(Type serviceType, ILogger logger)
         }
         else if (type == MessageType.Log)
         {
-            var level = reader.ReadString();
-            var msg = reader.ReadString();
-            if (Enum.TryParse<LogLevel>(level, out var logLevel))
-            {
-                logger.Log(logLevel, "[Runner] {Message}", msg);
-            }
-            else
-            {
-                logger.LogInformation("[Runner] {Message}", msg);
-            }
+            var (logLevel, msg) = MessageProtocol.ReadLog(reader);
+            logger.Log(logLevel, "[Runner] {Message}", msg);
         }
         else if (type == MessageType.Response)
         {
@@ -240,22 +236,17 @@ public class ProcessManager(Type serviceType, ILogger logger)
             var status = reader.ReadString();
             var length = reader.ReadInt32();
             var bytes = reader.ReadBytes(length);
-            var result = length > 0 ? MessagePackSerializer.Deserialize<object>(bytes) : null;
-            HandleResponse(id, status, result);
-        }
-    }
-
-    private void HandleResponse(int id, string status, object? result)
-    {
-        if (pendingRequests.TryRemove(id, out var tcs))
-        {
-            if (status == "success")
+            if (pendingRequests.TryRemove(id, out var pr))
             {
-                tcs.SetResult(result);
-            }
-            else if (status == "error")
-            {
-                tcs.SetException(new Exception(result?.ToString() ?? "Unknown error"));
+                var result = MessageProtocol.DeserializeResult(pr.ReturnType, status, bytes);
+                if (status == "success")
+                {
+                    pr.Tcs.SetResult(result);
+                }
+                else if (status == "error")
+                {
+                    pr.Tcs.SetException(new Exception(result?.ToString() ?? "Unknown error"));
+                }
             }
         }
     }
