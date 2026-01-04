@@ -9,7 +9,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.1" />
-    <ProjectReference Include="..\src\SeparateProcess.csproj" />
+    <ProjectReference Include="..\..\src\SeparateProcess\SeparateProcess.csproj" />
   </ItemGroup>
 
 </Project>
